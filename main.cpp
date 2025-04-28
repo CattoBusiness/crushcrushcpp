@@ -4,6 +4,8 @@
 #include <vector>
 #include <string>
 #include <map>
+#include <sstream>
+#include <limits> // Added for std::numeric_limits
 
 // Structure to store patch information for restoration
 struct PatchInfo {
@@ -81,15 +83,23 @@ private:
         return WriteProcessMemory(processHandle, (LPVOID)address, &value, sizeof(T), nullptr);
     }
 
+    // Read bytes from memory
+    std::vector<BYTE> ReadBytes(uintptr_t address, size_t size) {
+        std::vector<BYTE> buffer(size);
+        ReadProcessMemory(processHandle, (LPCVOID)address, buffer.data(), size, nullptr);
+        return buffer;
+    }
+
     // Find memory address using pattern scanning
-    uintptr_t FindPatternAddress(const std::vector<BYTE>& pattern, const std::string& mask) {
+    uintptr_t FindPatternAddress(const std::vector<BYTE>& pattern, const std::string& mask, uintptr_t startAddress = 0, uintptr_t endAddress = 0) {
         MEMORY_BASIC_INFORMATION mbi;
-        uintptr_t address = moduleBase;
+        uintptr_t address = startAddress != 0 ? startAddress : moduleBase;
+        uintptr_t endAddr = endAddress != 0 ? endAddress : 0xFFFFFFFF;
         
-        while (VirtualQueryEx(processHandle, (LPCVOID)address, &mbi, sizeof(mbi))) {
+        while (VirtualQueryEx(processHandle, (LPCVOID)address, &mbi, sizeof(mbi)) && address < endAddr) {
             if (mbi.State == MEM_COMMIT && (mbi.Protect == PAGE_EXECUTE_READ || 
-                                            mbi.Protect == PAGE_EXECUTE_READWRITE || 
-                                            mbi.Protect == PAGE_READWRITE)) {
+                                           mbi.Protect == PAGE_EXECUTE_READWRITE || 
+                                           mbi.Protect == PAGE_READWRITE)) {
                 std::vector<BYTE> buffer(mbi.RegionSize);
                 SIZE_T bytesRead;
                 
@@ -113,6 +123,41 @@ private:
             address = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
         }
         return 0;
+    }
+    
+    // Find pattern in module range
+    uintptr_t FindPatternInModule(const std::vector<BYTE>& pattern, const std::string& mask, 
+                                 const std::string& moduleName, uintptr_t startOffset, uintptr_t endOffset) {
+        // Get module info
+        MODULEENTRY32 moduleEntry = {0};
+        moduleEntry.dwSize = sizeof(MODULEENTRY32);
+        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, processId);
+        
+        if (snapshot == INVALID_HANDLE_VALUE) {
+            return 0;
+        }
+        
+        bool foundModule = false;
+        if (Module32First(snapshot, &moduleEntry)) {
+            do {
+                if (_stricmp(moduleEntry.szModule, moduleName.c_str()) == 0) {
+                    foundModule = true;
+                    break;
+                }
+            } while (Module32Next(snapshot, &moduleEntry));
+        }
+        
+        CloseHandle(snapshot);
+        
+        if (!foundModule) {
+            return 0;
+        }
+        
+        uintptr_t moduleBaseAddr = (uintptr_t)moduleEntry.modBaseAddr;
+        uintptr_t startAddress = moduleBaseAddr + startOffset;
+        uintptr_t endAddress = moduleBaseAddr + endOffset;
+        
+        return FindPatternAddress(pattern, mask, startAddress, endAddress);
     }
 
     // Apply memory patch with backup for restoration
@@ -154,11 +199,78 @@ private:
         return true;
     }
 
-    // Read bytes from memory
-    std::vector<BYTE> ReadBytes(uintptr_t address, size_t size) {
-        std::vector<BYTE> buffer(size);
-        ReadProcessMemory(processHandle, (LPCVOID)address, buffer.data(), size, nullptr);
-        return buffer;
+    // AOBScanRegion - Mimic Cheat Engine's function
+    uintptr_t AOBScanRegion(const std::string& functionName, uintptr_t startOffset, uintptr_t endOffset, 
+                           const std::vector<BYTE>& pattern) {
+        std::string mask(pattern.size(), 'x');  // All bytes are matched exactly
+        
+        uintptr_t result = FindPatternAddress(pattern, mask);
+        if (result == 0) {
+            std::cout << "Failed to find pattern for " << functionName << std::endl;
+        } else {
+            std::cout << "Found " << functionName << " pattern at: 0x" << std::hex << result << std::dec << std::endl;
+        }
+        
+        return result;
+    }
+
+    // Create a code injection patch (used by most CE table's patches)
+    bool CreateCodeInjection(uintptr_t address, const std::vector<BYTE>& originalCode, 
+                            const std::vector<BYTE>& injectedCode, const std::string& patchName) {
+        // Allocate memory for our new code
+        LPVOID newMem = VirtualAllocEx(processHandle, NULL, 0x200, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (!newMem) {
+            std::cout << "Failed to allocate memory for " << patchName << std::endl;
+            return false;
+        }
+        
+        // Store allocated memory for cleanup
+        allocatedMemory[patchName] = newMem;
+        
+        // Create a jump to our new code
+        std::vector<BYTE> jumpPatch = {
+            0xE9, 0x00, 0x00, 0x00, 0x00, // jmp newmem
+            0x90                          // nop (for alignment)
+        };
+        
+        // Calculate the jump offset
+        int jumpOffset = (int)((uintptr_t)newMem - address - 5);
+        memcpy(&jumpPatch[1], &jumpOffset, 4);
+        
+        // Create our new code block: injected code + original code + jump back
+        std::vector<BYTE> newCode = injectedCode;
+        
+        // Add the original code
+        newCode.insert(newCode.end(), originalCode.begin(), originalCode.end());
+        
+        // Add jump back to original code path
+        std::vector<BYTE> jumpBack = {
+            0xE9, 0x00, 0x00, 0x00, 0x00  // jmp back
+        };
+        
+        int jumpBackOffset = (int)(address + originalCode.size() - ((uintptr_t)newMem + newCode.size() + 5));
+        memcpy(&jumpBack[1], &jumpBackOffset, 4);
+        
+        newCode.insert(newCode.end(), jumpBack.begin(), jumpBack.end());
+        
+        // Write our new code
+        if (!WriteProcessMemory(processHandle, newMem, newCode.data(), newCode.size(), nullptr)) {
+            std::cout << "Failed to write code injection for " << patchName << std::endl;
+            VirtualFreeEx(processHandle, newMem, 0, MEM_RELEASE);
+            allocatedMemory.erase(patchName);
+            return false;
+        }
+        
+        // Apply jump patch
+        if (!PatchMemory(address, jumpPatch, patchName)) {
+            std::cout << "Failed to apply jump patch for " << patchName << std::endl;
+            VirtualFreeEx(processHandle, newMem, 0, MEM_RELEASE);
+            allocatedMemory.erase(patchName);
+            return false;
+        }
+        
+        std::cout << patchName << " patch applied successfully!" << std::endl;
+        return true;
     }
 
 public:
@@ -311,85 +423,31 @@ public:
         
         // Pattern from cheat table: 88 87 E5 00 00 00 DD 87 D0
         std::vector<BYTE> pattern = {0x88, 0x87, 0xE5, 0x00, 0x00, 0x00, 0xDD, 0x87, 0xD0};
-        std::string mask = "xxxxxxxxx";
         
-        uintptr_t patternAddress = FindPatternAddress(pattern, mask);
+        uintptr_t patternAddress = AOBScanRegion("Cellphone:Update+3da", 0, 0, pattern);
         if (patternAddress == 0) {
-            std::cout << "Failed to find message cooldown pattern" << std::endl;
             return false;
         }
-        
-        std::cout << "Found message cooldown pattern at: 0x" << std::hex << patternAddress << std::dec << std::endl;
         
         // Define noMsgCd as patternAddress+6 like in the cheat table
         uintptr_t noMsgCd = patternAddress + 6;
         
-        // Create new memory for our patch code
-        LPVOID newmem = VirtualAllocEx(processHandle, NULL, 0x200, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-        if (!newmem) {
-            std::cout << "Failed to allocate memory for patch" << std::endl;
-            return false;
-        }
+        // Original bytes at noMsgCd
+        std::vector<BYTE> originalBytes = ReadBytes(noMsgCd, 6);
         
-        // Store allocated memory for cleanup
-        allocatedMemory[patchName] = newmem;
-        
-        // Create the jump to our new code
-        std::vector<BYTE> jumpPatch = {
-            0xE9, 0x00, 0x00, 0x00, 0x00, // jmp newmem
-            0x90                          // nop
-        };
-        
-        // Calculate the jump offset
-        int jumpOffset = (int)((uintptr_t)newmem - noMsgCd - 5);
-        memcpy(&jumpPatch[1], &jumpOffset, 4);
-        
-        // Backup original instructions
-        std::vector<BYTE> originalInstructions = ReadBytes(noMsgCd, 6);
-        
-        // Create our new code exactly like in Cheat Engine
-        std::vector<BYTE> newCode = {
+        // Code to inject - set current time to 0
+        std::vector<BYTE> injectedCode = {
             0x50,                         // push eax
             0xB8, 0x00, 0x00, 0x00, 0x00, // mov eax, 0
             0x89, 0x87, 0xD0, 0x00, 0x00, 0x00, // mov [edi+D0], eax  // currentTime
             0x89, 0x87, 0xD4, 0x00, 0x00, 0x00, // mov [edi+D4], eax
-            0x58,                         // pop eax
+            0x58                          // pop eax
         };
         
-        // Add original instructions
-        newCode.insert(newCode.end(), originalInstructions.begin(), originalInstructions.end());
-        
-        // Add jump back to original code
-        std::vector<BYTE> jumpBack = {
-            0xE9, 0x00, 0x00, 0x00, 0x00  // jmp back
-        };
-        
-        int jumpBackOffset = (int)(noMsgCd + 6 - ((uintptr_t)newmem + newCode.size() + 5));
-        memcpy(&jumpBack[1], &jumpBackOffset, 4);
-        
-        newCode.insert(newCode.end(), jumpBack.begin(), jumpBack.end());
-        
-        // Write our new code
-        if (!WriteProcessMemory(processHandle, newmem, newCode.data(), newCode.size(), nullptr)) {
-            std::cout << "Failed to write new code" << std::endl;
-            VirtualFreeEx(processHandle, newmem, 0, MEM_RELEASE);
-            allocatedMemory.erase(patchName);
-            return false;
-        }
-        
-        // Apply jump patch with backup for restoration
-        if (!PatchMemory(noMsgCd, jumpPatch, patchName)) {
-            std::cout << "Failed to apply jump patch" << std::endl;
-            VirtualFreeEx(processHandle, newmem, 0, MEM_RELEASE);
-            allocatedMemory.erase(patchName);
-            return false;
-        }
-        
-        std::cout << "No messages cooldown patch applied successfully!" << std::endl;
-        return true;
+        return CreateCodeInjection(noMsgCd, originalBytes, injectedCode, patchName);
     }
 
-    // Free Store Items - Diamond purchases cost nothing
+    // Free Store Items (diamond purchasables only)
     bool FreeStoreItems() {
         if (!connected) {
             std::cout << "Not connected to the game" << std::endl;
@@ -404,35 +462,92 @@ public:
             return false;
         }
         
-        // Pattern from cheat table: 8B 45 0C 89 41 0C 8B 45 10
-        std::vector<BYTE> pattern = {0x8B, 0x45, 0x0C, 0x89, 0x41, 0x0C, 0x8B, 0x45, 0x10};
-        std::string mask = "xxxxxxxxx";
+        // We need to patch BOTH places:
+        // 1. First the diamond check (comparing player's diamonds with the cost)
+        std::string checkPatchName = "DiamondCheck";
+        std::vector<BYTE> checkPattern = {0x83, 0xEC, 0x0C, 0xFF, 0x75, 0x08, 0xE8}; // Common function pattern before diamond check
+        std::string checkMask = "xxxxxxx";
         
-        uintptr_t patternAddress = FindPatternAddress(pattern, mask);
-        if (patternAddress == 0) {
-            std::cout << "Failed to find store purchase pattern" << std::endl;
-            return false;
+        uintptr_t checkAddr = FindPatternAddress(checkPattern, checkMask);
+        if (checkAddr != 0) {
+            // Look for comparison code after this pattern (usually within 50 bytes)
+            std::vector<BYTE> cmpPattern = {0x3B, 0x00, 0x0F, 0x8C}; // cmp eax, [reg]; jl (jump if less)
+            std::string cmpMask = "x?xx";
+            
+            uintptr_t cmpAddr = FindPatternAddress(cmpPattern, cmpMask, checkAddr, checkAddr + 100);
+            
+            if (cmpAddr != 0) {
+                std::cout << "Found diamond check at: 0x" << std::hex << cmpAddr << std::dec << std::endl;
+                
+                // Patch to always pass the check
+                std::vector<BYTE> nopPatch(10, 0x90); // Fill with NOPs
+                
+                if (!PatchMemory(cmpAddr, nopPatch, checkPatchName)) {
+                    std::cout << "Failed to patch diamond check" << std::endl;
+                }
+                else {
+                    std::cout << "Diamond check bypassed!" << std::endl;
+                }
+            }
         }
         
-        std::cout << "Found store purchase pattern at: 0x" << std::hex << patternAddress << std::dec << std::endl;
+        // 2. The actual purchase cost setting
+        // Pattern from cheat table: 8B 45 0C 89 41 0C 8B 45 10
+        std::vector<BYTE> pattern = {0x8B, 0x45, 0x0C, 0x89, 0x41, 0x0C, 0x8B, 0x45, 0x10};
         
-        // Create patch to set cost to 0
-        std::vector<BYTE> patch = {
-            0x8B, 0x45, 0x0C,                   // mov eax, [ebp+0C]
-            0x89, 0x41, 0x0C,                   // mov [ecx+0C], eax
+        uintptr_t patternAddress = AOBScanRegion("Store2:PurchaseItem", 0, 0, pattern);
+        if (patternAddress == 0) {
+            // Try an alternative pattern search
+            std::vector<BYTE> altPattern = {0x8B, 0x45, 0x10, 0x89, 0x41, 0x10, 0x8B, 0x45, 0x14};
+            patternAddress = FindPatternAddress(altPattern, std::string(altPattern.size(), 'x'));
+            
+            if (patternAddress == 0) {
+                std::cout << "Could not find store purchase pattern" << std::endl;
+                return false;
+            }
+            
+            // Adjust to get to the right spot
+            patternAddress -= 6;
+        }
+        
+        std::cout << "Found store purchase at: 0x" << std::hex << patternAddress << std::dec << std::endl;
+        
+        // Original bytes - we need the first 6 bytes
+        std::vector<BYTE> originalBytes = ReadBytes(patternAddress, 6);
+        
+        // Injected code - set [ebp+10] to 0 (cost parameter)
+        std::vector<BYTE> injectedCode = {
+            // Keep original instructions
+            // 8B 45 0C           - mov eax, [ebp+0C]
+            // 89 41 0C           - mov [ecx+0C], eax
+            // Then add:
             0xC7, 0x45, 0x10, 0x00, 0x00, 0x00, 0x00  // mov [ebp+10], 0 (cost param)
         };
         
-        if (!PatchMemory(patternAddress, patch, patchName)) {
-            std::cout << "Failed to patch store items" << std::endl;
-            return false;
+        bool result = CreateCodeInjection(patternAddress, originalBytes, injectedCode, patchName);
+        
+        // Additionally, try to find and patch the diamond UI check
+        std::vector<BYTE> uiPattern = {0x81, 0x7D, 0x00, 0xC8, 0x00, 0x00, 0x00}; // cmp [ebp+X], 200
+        std::string uiMask = "xx?xxxx";
+        
+        uintptr_t uiAddr = FindPatternAddress(uiPattern, uiMask);
+        if (uiAddr != 0) {
+            std::cout << "Found UI diamond check at: 0x" << std::hex << uiAddr << std::dec << std::endl;
+            
+            // Patch to skip this check
+            std::vector<BYTE> uiPatch = {
+                0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 // NOPs
+            };
+            
+            if (PatchMemory(uiAddr, uiPatch, "DiamondUICheck")) {
+                std::cout << "UI diamond check patched!" << std::endl;
+            }
         }
         
-        std::cout << "Free store items patch applied successfully!" << std::endl;
-        return true;
+        return result;
     }
 
-    // Meet Hearts Requirement
+    // Meet Hearts Requirement - Exactly as in Cheat Engine table
     bool MeetHeartsRequirement() {
         if (!connected) {
             std::cout << "Not connected to the game" << std::endl;
@@ -449,41 +564,36 @@ public:
         
         // Pattern from cheat table: 8B 50 7C 8B 40 78 C9 C3
         std::vector<BYTE> pattern = {0x8B, 0x50, 0x7C, 0x8B, 0x40, 0x78, 0xC9, 0xC3};
-        std::string mask = "xxxxxxxx";
         
-        uintptr_t patternAddress = FindPatternAddress(pattern, mask);
+        uintptr_t patternAddress = AOBScanRegion("Girl:get_HeartRequirement", 0, 0, pattern);
         if (patternAddress == 0) {
-            std::cout << "Failed to find heart requirement pattern" << std::endl;
             return false;
         }
         
-        std::cout << "Found heart requirement pattern at: 0x" << std::hex << patternAddress << std::dec << std::endl;
+        // Original bytes
+        std::vector<BYTE> originalBytes = ReadBytes(patternAddress, 6);
         
-        // Create patch to set hearts to the required amount
-        std::vector<BYTE> patch = {
+        // Injected code to set hearts to the required amount
+        // This matches the Cheat Engine table approach
+        int heartsOffset = 0x48; // Based on your CT file's heartsOffset
+
+        std::vector<BYTE> injectedCode = {
             0x57,                       // push edi
             0x8B, 0xF8,                 // mov edi, eax
-            0x8B, 0x50, 0x7C,           // mov edx, [eax+7C]
-            0x8B, 0x40, 0x78,           // mov eax, [eax+78]
+            // Original instructions
+            // 8B 50 7C                 // mov edx, [eax+7C]
+            // 8B 40 78                 // mov eax, [eax+78]
             0x85, 0xD2,                 // test edx, edx
-            0x78, 0x06,                 // js skip (if negative value)
-            0x89, 0x97, 0x4C, 0x00, 0x00, 0x00, // mov [edi+48+4], edx (hearts offset+4)
-            0x89, 0x87, 0x48, 0x00, 0x00, 0x00, // mov [edi+48], eax (hearts offset)
-            0x5F,                       // pop edi
-            0xC9,                       // leave
-            0xC3                        // ret
+            0x78, 0x0A,                 // js +0A (skip if negative)
+            0x89, 0x97, (BYTE)(heartsOffset+4), 0x00, 0x00, 0x00, // mov [edi+heartsOffset+4], edx
+            0x89, 0x87, (BYTE)heartsOffset, 0x00, 0x00, 0x00,      // mov [edi+heartsOffset], eax
+            0x5F                        // pop edi
         };
         
-        if (!PatchMemory(patternAddress, patch, patchName)) {
-            std::cout << "Failed to patch heart requirements" << std::endl;
-            return false;
-        }
-        
-        std::cout << "Meet hearts requirement patch applied successfully!" << std::endl;
-        return true;
+        return CreateCodeInjection(patternAddress, originalBytes, injectedCode, patchName);
     }
 
-    // Meet Requirements (general)
+    // Meet Requirements (general) - Exactly as in Cheat Engine table
     bool MeetRequirements() {
         if (!connected) {
             std::cout << "Not connected to the game" << std::endl;
@@ -498,19 +608,15 @@ public:
             return false;
         }
         
-        // Pattern for Girl:MeetsRequirements+10f in the cheat table
+        // Pattern for Girl:MeetsRequirements+10f
         std::vector<BYTE> pattern = {0x8D, 0x65, 0xF4, 0x5E, 0x5F};
-        std::string mask = "xxxxx";
         
-        uintptr_t patternAddress = FindPatternAddress(pattern, mask);
+        uintptr_t patternAddress = AOBScanRegion("Girl:MeetsRequirements+10f", 0, 0, pattern);
         if (patternAddress == 0) {
-            std::cout << "Failed to find requirements pattern" << std::endl;
             return false;
         }
         
-        std::cout << "Found requirements pattern at: 0x" << std::hex << patternAddress << std::dec << std::endl;
-        
-        // Create patch to always return true (1)
+        // Create a direct patch to force return value to 1
         std::vector<BYTE> patch = {
             0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
             0x8D, 0x65, 0xF4,             // lea esp, [ebp-0C]
@@ -518,151 +624,17 @@ public:
             0x5F                          // pop edi
         };
         
-        if (!PatchMemory(patternAddress - 5, patch, patchName)) {
-            std::cout << "Failed to patch general requirements" << std::endl;
-            return false;
-        }
-        
-        std::cout << "Meet general requirements patch applied successfully!" << std::endl;
-        return true;
-    }
-
-    // Unlock All Outfits
-    bool UnlockAllOutfits() {
-        if (!connected) {
-            std::cout << "Not connected to the game" << std::endl;
-            return false;
-        }
-        
-        std::string patchName = "UnlockAllOutfits";
-        
-        // Check if already applied
-        if (appliedPatches.find(patchName) != appliedPatches.end()) {
-            std::cout << "Unlock all outfits is already active" << std::endl;
-            return false;
-        }
-        
-        // Pattern from cheat table: 8B 80 94 00 00 00 8B 4E 20
-        std::vector<BYTE> pattern = {0x8B, 0x80, 0x94, 0x00, 0x00, 0x00, 0x8B, 0x4E, 0x20};
-        std::string mask = "xxxxxxxxx";
-        
-        uintptr_t patternAddress = FindPatternAddress(pattern, mask);
-        if (patternAddress == 0) {
-            std::cout << "Failed to find outfit unlock pattern" << std::endl;
-            return false;
-        }
-        
-        std::cout << "Found outfit unlock pattern at: 0x" << std::hex << patternAddress << std::dec << std::endl;
-        
-        // Create patch to OR outfits instead of AND
-        std::vector<BYTE> patch = {
-            0x52,                         // push edx
-            0x8B, 0xD8,                   // mov ebx, eax
-            0x8B, 0x80, 0x94, 0x00, 0x00, 0x00, // mov eax,[eax+00000094]
-            0x8B, 0x4E, 0x20,             // mov ecx,[esi+20]
-            0x0B, 0xC1,                   // or eax, ecx
-            0x89, 0x83, 0x94, 0x00, 0x00, 0x00, // mov [ebx+94], eax
-            0x5A                          // pop edx
-        };
-        
+        // Apply the patch directly
         if (!PatchMemory(patternAddress, patch, patchName)) {
-            std::cout << "Failed to patch outfit unlock" << std::endl;
+            std::cout << "Failed to patch meet requirements" << std::endl;
             return false;
         }
         
-        std::cout << "Unlock all outfits patch applied successfully!" << std::endl;
+        std::cout << "Meet requirements patch applied successfully!" << std::endl;
         return true;
     }
 
-    // Outfits cost 1 Diamond
-    bool OutfitsCostOneDiamond() {
-        if (!connected) {
-            std::cout << "Not connected to the game" << std::endl;
-            return false;
-        }
-        
-        std::string patchName = "OutfitsCostOneDiamond";
-        
-        // Check if already applied
-        if (appliedPatches.find(patchName) != appliedPatches.end()) {
-            std::cout << "Outfits cost 1 diamond is already active" << std::endl;
-            return false;
-        }
-        
-        // Pattern for Balance:GetOutfitDiamondCost+da
-        std::vector<BYTE> pattern = {0x8D, 0x65, 0xF4, 0x5E, 0x5F, 0x5B, 0xC9, 0xC3};
-        std::string mask = "xxxxxxxx";
-        
-        uintptr_t patternAddress = FindPatternAddress(pattern, mask);
-        if (patternAddress == 0) {
-            std::cout << "Failed to find outfit cost pattern" << std::endl;
-            return false;
-        }
-        
-        std::cout << "Found outfit cost pattern at: 0x" << std::hex << patternAddress << std::dec << std::endl;
-        
-        // Create patch to always return 1 diamond
-        std::vector<BYTE> patch = {
-            0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
-            0x8D, 0x65, 0xF4,             // lea esp, [ebp-0C]
-            0x5E,                         // pop esi
-            0x5F                          // pop edi
-        };
-        
-        if (!PatchMemory(patternAddress - 5, patch, patchName)) {
-            std::cout << "Failed to patch outfit cost" << std::endl;
-            return false;
-        }
-        
-        std::cout << "Outfits cost 1 diamond patch applied successfully!" << std::endl;
-        return true;
-    }
-
-    // Gifts cost no Diamonds
-    bool GiftsCostNoDiamonds() {
-        if (!connected) {
-            std::cout << "Not connected to the game" << std::endl;
-            return false;
-        }
-        
-        std::string patchName = "GiftsCostNoDiamonds";
-        
-        // Check if already applied
-        if (appliedPatches.find(patchName) != appliedPatches.end()) {
-            std::cout << "Gifts cost no diamonds is already active" << std::endl;
-            return false;
-        }
-        
-        // Pattern for GiftModel:GetGiftDiamondCost+90
-        std::vector<BYTE> pattern = {0x8D, 0x65, 0xF8, 0x5E, 0x5B};
-        std::string mask = "xxxxx";
-        
-        uintptr_t patternAddress = FindPatternAddress(pattern, mask);
-        if (patternAddress == 0) {
-            std::cout << "Failed to find gift cost pattern" << std::endl;
-            return false;
-        }
-        
-        std::cout << "Found gift cost pattern at: 0x" << std::hex << patternAddress << std::dec << std::endl;
-        
-        // Create patch to always return 0 diamonds
-        std::vector<BYTE> patch = {
-            0xB8, 0x00, 0x00, 0x00, 0x00, // mov eax, 0
-            0x8D, 0x65, 0xF8,             // lea esp, [ebp-08]
-            0x5E,                         // pop esi
-            0x5B                          // pop ebx
-        };
-        
-        if (!PatchMemory(patternAddress - 5, patch, patchName)) {
-            std::cout << "Failed to patch gift cost" << std::endl;
-            return false;
-        }
-        
-        std::cout << "Gifts cost no diamonds patch applied successfully!" << std::endl;
-        return true;
-    }
-
-    // No Talk Cooldown
+    // No Talk Cooldown - Exactly as in Cheat Engine table
     bool NoTalkCooldown() {
         if (!connected) {
             std::cout << "Not connected to the game" << std::endl;
@@ -677,19 +649,16 @@ public:
             return false;
         }
         
-        // Pattern for talk cooldown in the cheat table
+        // Pattern for Girls:BumpAffection+76
         std::vector<BYTE> pattern = {0xD9, 0x05, 0x00, 0x00, 0x00, 0x00, 0xD9, 0x5D, 0xFC};
         std::string mask = "xx????xxx";
         
-        uintptr_t patternAddress = FindPatternAddress(pattern, mask);
+        uintptr_t patternAddress = AOBScanRegion("Girls:BumpAffection+3b", 0, 0, pattern);
         if (patternAddress == 0) {
-            std::cout << "Failed to find talk cooldown pattern" << std::endl;
             return false;
         }
         
-        std::cout << "Found talk cooldown pattern at: 0x" << std::hex << patternAddress << std::dec << std::endl;
-        
-        // Create new memory for our constant
+        // Create memory for the cooldown value
         LPVOID cooldownMem = VirtualAllocEx(processHandle, NULL, 4, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         if (!cooldownMem) {
             std::cout << "Failed to allocate memory for cooldown value" << std::endl;
@@ -708,27 +677,145 @@ public:
             return false;
         }
         
-        // Create patch to load our cooldown value
-        std::vector<BYTE> patch = {
+        // Create code to load our cooldown value
+        std::vector<BYTE> injectedCode = {
             0xD9, 0x05, 0x00, 0x00, 0x00, 0x00  // fld dword ptr [cooldownMem]
         };
         
         // Set the address of our cooldown value
         DWORD cooldownAddr32 = (DWORD)(uintptr_t)cooldownMem;
-        memcpy(&patch[2], &cooldownAddr32, sizeof(DWORD));
+        memcpy(&injectedCode[2], &cooldownAddr32, sizeof(DWORD));
         
-        if (!PatchMemory(patternAddress, patch, patchName)) {
-            std::cout << "Failed to patch talk cooldown" << std::endl;
-            VirtualFreeEx(processHandle, cooldownMem, 0, MEM_RELEASE);
-            allocatedMemory.erase(patchName);
+        // Original bytes
+        std::vector<BYTE> originalBytes = ReadBytes(patternAddress, 6);
+        
+        return CreateCodeInjection(patternAddress, originalBytes, injectedCode, patchName);
+    }
+
+    // Unlock All Outfits - Exactly as in Cheat Engine table
+    bool UnlockAllOutfits() {
+        if (!connected) {
+            std::cout << "Not connected to the game" << std::endl;
             return false;
         }
         
-        std::cout << "No talk cooldown patch applied successfully!" << std::endl;
+        std::string patchName = "UnlockAllOutfits";
+        
+        // Check if already applied
+        if (appliedPatches.find(patchName) != appliedPatches.end()) {
+            std::cout << "Unlock all outfits is already active" << std::endl;
+            return false;
+        }
+        
+        // Pattern from cheat table: 8B 80 94 00 00 00 8B 4E 20
+        std::vector<BYTE> pattern = {0x8B, 0x80, 0x94, 0x00, 0x00, 0x00, 0x8B, 0x4E, 0x20};
+        
+        uintptr_t patternAddress = AOBScanRegion("Gift:Init+2ef", 0, 0, pattern);
+        if (patternAddress == 0) {
+            return false;
+        }
+        
+        // Original bytes
+        std::vector<BYTE> originalBytes = ReadBytes(patternAddress, 9);
+        
+        // Injected code to OR outfits instead of AND
+        std::vector<BYTE> injectedCode = {
+            0x53,                         // push ebx
+            0x8B, 0xD8,                   // mov ebx, eax
+            // Original instructions
+            // 8B 80 94 00 00 00          // mov eax, [eax+94]
+            // 8B 4E 20                   // mov ecx, [esi+20]
+            0x0B, 0xC1,                   // or eax, ecx
+            0x89, 0x83, 0x94, 0x00, 0x00, 0x00, // mov [ebx+94], eax
+            0x5B                          // pop ebx
+        };
+        
+        return CreateCodeInjection(patternAddress, originalBytes, injectedCode, patchName);
+    }
+
+    // Outfits cost 1 Diamond - Exactly as in Cheat Engine table
+    bool OutfitsCostOneDiamond() {
+        if (!connected) {
+            std::cout << "Not connected to the game" << std::endl;
+            return false;
+        }
+        
+        std::string patchName = "OutfitsCostOneDiamond";
+        
+        // Check if already applied
+        if (appliedPatches.find(patchName) != appliedPatches.end()) {
+            std::cout << "Outfits cost 1 diamond is already active" << std::endl;
+            return false;
+        }
+        
+        // Pattern for Balance:GetOutfitDiamondCost+da
+        std::vector<BYTE> pattern = {0x8D, 0x65, 0xF4, 0x5E, 0x5F, 0x5B, 0xC9, 0xC3};
+        
+        uintptr_t patternAddress = AOBScanRegion("Balance:GetOutfitDiamondCost+188", 0, 0, pattern);
+        if (patternAddress == 0) {
+            return false;
+        }
+        
+        // Create patch to always return 1 diamond
+        std::vector<BYTE> patch = {
+            0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+            0x8D, 0x65, 0xF4,             // lea esp, [ebp-0C]
+            0x5E,                         // pop esi
+            0x5F                          // pop edi
+        };
+        
+        // Apply the patch directly
+        if (!PatchMemory(patternAddress, patch, patchName)) {
+            std::cout << "Failed to patch outfit cost" << std::endl;
+            return false;
+        }
+        
+        std::cout << "Outfits cost 1 diamond patch applied successfully!" << std::endl;
         return true;
     }
 
-    // Max Hobby Level
+    // Gifts cost no Diamonds - Exactly as in Cheat Engine table
+    bool GiftsCostNoDiamonds() {
+        if (!connected) {
+            std::cout << "Not connected to the game" << std::endl;
+            return false;
+        }
+        
+        std::string patchName = "GiftsCostNoDiamonds";
+        
+        // Check if already applied
+        if (appliedPatches.find(patchName) != appliedPatches.end()) {
+            std::cout << "Gifts cost no diamonds is already active" << std::endl;
+            return false;
+        }
+        
+        // Pattern for GiftModel:GetGiftDiamondCost+90
+        std::vector<BYTE> pattern = {0x8D, 0x65, 0xF8, 0x5E, 0x5B};
+        
+        uintptr_t patternAddress = AOBScanRegion("GiftModel:GetGiftDiamondCost+90", 0, 0, pattern);
+        if (patternAddress == 0) {
+            return false;
+        }
+        
+        // Create patch to always return 0 diamonds
+        std::vector<BYTE> patch = {
+            0xB8, 0x00, 0x00, 0x00, 0x00, // mov eax, 0
+            0x8D, 0x65, 0xF8,             // lea esp, [ebp-08]
+            0x5E,                         // pop esi
+            0x5B                          // pop ebx
+        };
+        
+        // Apply the patch directly
+        if (!PatchMemory(patternAddress, patch, patchName)) {
+            std::cout << "Failed to patch gift cost" << std::endl;
+            return false;
+        }
+        
+        std::cout << "Gifts cost no diamonds patch applied successfully!" << std::endl;
+        return true;
+    }
+
+    // Max Hobby Level / No Hobby Cooldown - Exactly as in Cheat Engine table
     bool MaxHobbyLevel() {
         if (!connected) {
             std::cout << "Not connected to the game" << std::endl;
@@ -745,17 +832,13 @@ public:
         
         // Pattern for Hobby2:get_BaseTime+64
         std::vector<BYTE> pattern = {0xDD, 0x00, 0x8D, 0x65, 0xFC};
-        std::string mask = "xxxxx";
         
-        uintptr_t patternAddress = FindPatternAddress(pattern, mask);
+        uintptr_t patternAddress = AOBScanRegion("Hobby2:get_BaseTime+64", 0, 0, pattern);
         if (patternAddress == 0) {
-            std::cout << "Failed to find hobby level pattern" << std::endl;
             return false;
         }
         
-        std::cout << "Found hobby level pattern at: 0x" << std::hex << patternAddress << std::dec << std::endl;
-        
-        // Create memory for our time value
+        // Allocate memory for our value
         LPVOID timeMem = VirtualAllocEx(processHandle, NULL, 8, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         if (!timeMem) {
             std::cout << "Failed to allocate memory for hobby time value" << std::endl;
@@ -774,17 +857,21 @@ public:
             return false;
         }
         
-        // Create the patch code
-        std::vector<BYTE> patch = {
+        // Original bytes
+        std::vector<BYTE> originalBytes = ReadBytes(patternAddress, 5);
+        
+        // Injected code to load our time value
+        std::vector<BYTE> injectedCode = {
             0xDD, 0x05, 0x00, 0x00, 0x00, 0x00, // fld qword ptr [timeMem]
             0x8D, 0x65, 0xFC                    // lea esp, [ebp-04]
         };
         
         // Set the address of our time value
         DWORD timeAddr32 = (DWORD)(uintptr_t)timeMem;
-        memcpy(&patch[2], &timeAddr32, sizeof(DWORD));
+        memcpy(&injectedCode[2], &timeAddr32, sizeof(DWORD));
         
-        if (!PatchMemory(patternAddress, patch, patchName)) {
+        // Apply patch using the CE approach (direct patch in this case)
+        if (!PatchMemory(patternAddress, injectedCode, patchName)) {
             std::cout << "Failed to patch hobby level" << std::endl;
             VirtualFreeEx(processHandle, timeMem, 0, MEM_RELEASE);
             allocatedMemory.erase(patchName);
@@ -795,7 +882,7 @@ public:
         return true;
     }
 
-    // No Job Cooldown
+    // No Job Cooldown - Exactly as in Cheat Engine table
     bool NoJobCooldown() {
         if (!connected) {
             std::cout << "Not connected to the game" << std::endl;
@@ -810,37 +897,29 @@ public:
             return false;
         }
         
-        // Pattern from cheat table: D9 87 ? ? ? 00 D9 ? ? DE C1 D9 ? ? DF F1
+        // Pattern from cheat table: D9 87 8C 00 00 00 D9 45 0C
         std::vector<BYTE> pattern = {0xD9, 0x87, 0x8C, 0x00, 0x00, 0x00, 0xD9, 0x45, 0x0C};
-        std::string mask = "xxxxxxxxx";
         
-        uintptr_t patternAddress = FindPatternAddress(pattern, mask);
+        uintptr_t patternAddress = AOBScanRegion("Job2:PerformUpdate+68", 0, 0, pattern);
         if (patternAddress == 0) {
-            std::cout << "Failed to find job cooldown pattern" << std::endl;
             return false;
         }
         
-        std::cout << "Found job cooldown pattern at: 0x" << std::hex << patternAddress << std::dec << std::endl;
+        // Original bytes
+        std::vector<BYTE> originalBytes = ReadBytes(patternAddress, 6);
         
-        // Create patch to keep job progress at max
-        std::vector<BYTE> patch = {
+        // Injected code to set job progress
+        std::vector<BYTE> injectedCode = {
             0x50,                                   // push eax
             0x8B, 0x45, 0xE4,                       // mov eax, [ebp-1C]
             0x89, 0x87, 0x8C, 0x00, 0x00, 0x00,     // mov [edi+8C], eax
-            0x58,                                   // pop eax
-            0xD9, 0x87, 0x8C, 0x00, 0x00, 0x00      // fld dword ptr [edi+0000008C]
+            0x58                                    // pop eax
         };
         
-        if (!PatchMemory(patternAddress, patch, patchName)) {
-            std::cout << "Failed to patch job cooldown" << std::endl;
-            return false;
-        }
-        
-        std::cout << "No job cooldown patch applied successfully!" << std::endl;
-        return true;
+        return CreateCodeInjection(patternAddress, originalBytes, injectedCode, patchName);
     }
 
-    // Max Job Experience
+    // Max Job Experience - Exactly as in Cheat Engine table
     bool MaxJobExperience() {
         if (!connected) {
             std::cout << "Not connected to the game" << std::endl;
@@ -857,20 +936,20 @@ public:
         
         // Pattern for Job2:get_ExperienceToLevel+22
         std::vector<BYTE> pattern = {0x8B, 0x50, 0x1C, 0x8B, 0x40, 0x18};
-        std::string mask = "xxxxxx";
         
-        uintptr_t patternAddress = FindPatternAddress(pattern, mask);
+        uintptr_t patternAddress = AOBScanRegion("Job2:get_ExperienceToLevel+22", 0, 0, pattern);
         if (patternAddress == 0) {
-            std::cout << "Failed to find job experience pattern" << std::endl;
             return false;
         }
         
-        std::cout << "Found job experience pattern at: 0x" << std::hex << patternAddress << std::dec << std::endl;
+        // Original bytes
+        std::vector<BYTE> originalBytes = ReadBytes(patternAddress, 6);
         
-        // Create patch to set job experience to max
-        std::vector<BYTE> patch = {
-            0x8B, 0x50, 0x1C,           // mov edx, [eax+1C]
-            0x8B, 0x40, 0x18,           // mov eax, [eax+18]
+        // Injected code to set job experience
+        std::vector<BYTE> injectedCode = {
+            // Keep original instructions
+            // 8B 50 1C                 // mov edx, [eax+1C]
+            // 8B 40 18                 // mov eax, [eax+18]
             0x51,                       // push ecx
             0x8B, 0x4D, 0x08,           // mov ecx, [ebp+8]
             0x89, 0x91, 0x84, 0x00, 0x00, 0x00, // mov [ecx+84], edx
@@ -878,16 +957,10 @@ public:
             0x59                        // pop ecx
         };
         
-        if (!PatchMemory(patternAddress, patch, patchName)) {
-            std::cout << "Failed to patch job experience" << std::endl;
-            return false;
-        }
-        
-        std::cout << "Max job experience patch applied successfully!" << std::endl;
-        return true;
+        return CreateCodeInjection(patternAddress, originalBytes, injectedCode, patchName);
     }
 
-    // Show All Pinups
+    // Show All Pinups - Exactly as in Cheat Engine table
     bool ShowAllPinups() {
         if (!connected) {
             std::cout << "Not connected to the game" << std::endl;
@@ -904,15 +977,11 @@ public:
         
         // Pattern for Album:IsPinupUnlocked
         std::vector<BYTE> pattern = {0x55, 0x8B, 0xEC, 0x53, 0x57};
-        std::string mask = "xxxxx";
         
-        uintptr_t patternAddress = FindPatternAddress(pattern, mask);
+        uintptr_t patternAddress = AOBScanRegion("Album:IsPinupUnlocked", 0, 0, pattern);
         if (patternAddress == 0) {
-            std::cout << "Failed to find pinup unlock pattern" << std::endl;
             return false;
         }
-        
-        std::cout << "Found pinup unlock pattern at: 0x" << std::hex << patternAddress << std::dec << std::endl;
         
         // Create patch to always return true (1)
         std::vector<BYTE> patch = {
@@ -920,6 +989,7 @@ public:
             0xC3                          // ret
         };
         
+        // Apply the patch directly
         if (!PatchMemory(patternAddress, patch, patchName)) {
             std::cout << "Failed to patch pinup unlock" << std::endl;
             return false;
@@ -929,7 +999,7 @@ public:
         return true;
     }
 
-    // Unlock All Rewards and Girls
+    // Unlock All Rewards and Girls - Exactly as in Cheat Engine table
     bool UnlockAllRewardsAndGirls() {
         if (!connected) {
             std::cout << "Not connected to the game" << std::endl;
@@ -946,33 +1016,26 @@ public:
         
         // Pattern for AutoResizeBitArray:get_Item+42
         std::vector<BYTE> pattern = {0x8D, 0x44, 0x18, 0x10, 0x0F, 0xB6, 0x00, 0x89, 0x45};
-        std::string mask = "xxxxxxxxx";
         
-        uintptr_t patternAddress = FindPatternAddress(pattern, mask);
+        uintptr_t patternAddress = AOBScanRegion("AutoResizeBitArray:get_Item+1d", 0, 0, pattern);
         if (patternAddress == 0) {
-            std::cout << "Failed to find rewards array pattern" << std::endl;
             return false;
         }
         
-        std::cout << "Found rewards array pattern at: 0x" << std::hex << patternAddress << std::dec << std::endl;
+        // Original bytes (first 7 bytes)
+        std::vector<BYTE> originalBytes = ReadBytes(patternAddress, 7);
         
-        // Create patch to set all bits to 1 (FF)
-        std::vector<BYTE> patch = {
-            0x8D, 0x44, 0x18, 0x10,       // lea eax, [eax+ebx+10]
+        // Injected code to set all bits to FF
+        std::vector<BYTE> injectedCode = {
+            // Keep 8D 44 18 10           // lea eax, [eax+ebx+10]
             0xC6, 0x00, 0xFF,             // mov byte ptr [eax], FF
             0x0F, 0xB6, 0x00              // movzx eax, byte ptr [eax]
         };
         
-        if (!PatchMemory(patternAddress, patch, patchName)) {
-            std::cout << "Failed to patch rewards unlock" << std::endl;
-            return false;
-        }
-        
-        std::cout << "Unlock all rewards and girls patch applied successfully!" << std::endl;
-        return true;
+        return CreateCodeInjection(patternAddress, originalBytes, injectedCode, patchName);
     }
 
-    // Unlock DLCs (NSFW DLC)
+    // Unlock DLCs (NSFW DLC) - Exactly as in Cheat Engine table
     bool UnlockDLCs() {
         if (!connected) {
             std::cout << "Not connected to the game" << std::endl;
@@ -989,17 +1052,13 @@ public:
         
         // Pattern from cheat table: 83 C4 10 C9 C3
         std::vector<BYTE> pattern = {0x83, 0xC4, 0x10, 0xC9, 0xC3};
-        std::string mask = "xxxxx";
         
-        uintptr_t patternAddress = FindPatternAddress(pattern, mask);
+        uintptr_t patternAddress = AOBScanRegion("Steamworks.SteamApps:BIsDlcInstalled+3", 0, 0, pattern);
         if (patternAddress == 0) {
-            std::cout << "Failed to find DLC check pattern" << std::endl;
             return false;
         }
         
-        std::cout << "Found DLC check pattern at: 0x" << std::hex << patternAddress << std::dec << std::endl;
-        
-        // Create the patch exactly like in Cheat Engine - force return value to 1 (true)
+        // Create patch to always return true (1)
         std::vector<BYTE> patch = {
             0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
             0x83, 0xC4, 0x10,             // add esp, 10
@@ -1007,7 +1066,7 @@ public:
             0xC3                          // ret
         };
         
-        // Apply the patch exactly at patternAddress-5 like in Cheat Engine
+        // Apply the patch
         if (!PatchMemory(patternAddress - 5, patch, patchName)) {
             std::cout << "Failed to apply DLC unlock patch" << std::endl;
             return false;
@@ -1036,66 +1095,61 @@ public:
             return false;
         }
         
-        // Pattern for GameState.NSFW reference
-        std::vector<BYTE> pattern1 = {0x80, 0x3D, 0x00, 0x00, 0x00, 0x00, 0x00, 0x74}; // cmp byte ptr [GameState.NSFW], 0; je
-        std::string mask1 = "xx????xx";
+        // Based on Cheat Engine table, patching GameState.NSFW and GameState.NSFWAllowed
+        std::vector<BYTE> pattern = {0x80, 0x3D, 0x00, 0x00, 0x00, 0x00, 0x00, 0x74}; // cmp byte ptr [GameState.NSFW], 0; je
+        std::string mask = "xx????xx";
         
-        uintptr_t reference = FindPatternAddress(pattern1, mask1);
+        uintptr_t reference = FindPatternAddress(pattern, mask);
         if (reference != 0) {
-            // Found a reference to NSFW flag
-            std::cout << "Found NSFW flag reference at: 0x" << std::hex << reference << std::dec << std::endl;
-            
-            // Read the address from the instruction
-            int offset = ReadMemory<int>(reference + 2);
-            uintptr_t nsfwAddr = reference + 7 + offset;
-            
-            // Write 1 to NSFW flag
-            if (WriteMemory<BYTE>(nsfwAddr, 1)) {
-                std::cout << "NSFW flag enabled at: 0x" << std::hex << nsfwAddr << std::dec << std::endl;
-                
-                // Assume NSFWAllowed is at nsfwAddr+1
-                if (WriteMemory<BYTE>(nsfwAddr + 1, 1)) {
-                    std::cout << "NSFWAllowed flag enabled" << std::endl;
+            // Get the NSFW flag address
+            uintptr_t nsfwAddrPtr = 0;
+            if (ReadProcessMemory(processHandle, (LPCVOID)(reference + 2), &nsfwAddrPtr, 4, nullptr)) {
+                // Write 1 to NSFW flag
+                if (WriteMemory<BYTE>(nsfwAddrPtr, 1)) {
+                    std::cout << "NSFW flag enabled at: 0x" << std::hex << nsfwAddrPtr << std::dec << std::endl;
                     
-                    // Remember patch for restoration
-                    PatchInfo info;
-                    info.address = nsfwAddr;
-                    info.originalBytes = {0x00, 0x00}; // Assume both were 0
-                    info.name = patchName;
-                    appliedPatches[patchName] = info;
-                    
-                    return true;
+                    // Assume NSFWAllowed is at nsfwAddr+1 (next byte)
+                    if (WriteMemory<BYTE>(nsfwAddrPtr + 1, 1)) {
+                        std::cout << "NSFWAllowed flag enabled" << std::endl;
+                        
+                        // Remember patch for restoration
+                        PatchInfo info;
+                        info.address = nsfwAddrPtr;
+                        info.originalBytes = {0x00, 0x00}; // Assume both were 0
+                        info.name = patchName;
+                        appliedPatches[patchName] = info;
+                        
+                        return true;
+                    }
                 }
             }
         }
         
-        // Alternative approach: patch checks for NSFW flags
-        // Scan for comparison checks against NSFW flag
-        std::vector<BYTE> pattern2 = {0x80, 0x3D, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0F, 0x84}; // cmp byte ptr [GameState.NSFW], 0; je far
-        std::string mask2 = "xx????xxx";
+        // Alternative approach - bypass all NSFW checks
+        std::cout << "Could not directly enable NSFW flags, trying alternative approach..." << std::endl;
         
-        reference = FindPatternAddress(pattern2, mask2);
-        if (reference != 0) {
-            // Found a check against NSFW flag
-            std::cout << "Found NSFW check at: 0x" << std::hex << reference << std::dec << std::endl;
+        // Find all references to NSFW flag checks and patch them
+        std::vector<BYTE> checkPattern = {0x80, 0x3D, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0F, 0x84}; // cmp byte ptr [GameState.NSFW], 0; je far
+        std::string checkMask = "xx????xxx";
+        
+        uintptr_t checkAddr = FindPatternAddress(checkPattern, checkMask);
+        if (checkAddr != 0) {
+            std::cout << "Found NSFW check at: 0x" << std::hex << checkAddr << std::dec << std::endl;
             
-            // Create patch to skip the check
-            std::vector<BYTE> patch = {
-                0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 // Replace with NOPs
-            };
+            // Patch to always pass the check
+            std::vector<BYTE> nopPatch(9, 0x90); // Replace with NOPs
             
-            if (PatchMemory(reference, patch, patchName)) {
-                std::cout << "NSFW check patched" << std::endl;
+            if (PatchMemory(checkAddr, nopPatch, "NSFWCheck")) {
+                std::cout << "NSFW check patched - should be enabled after restart" << std::endl;
                 return true;
             }
         }
         
-        std::cout << "Could not find or enable NSFW settings" << std::endl;
-        std::cout << "Try restarting the game after enabling DLC unlock" << std::endl;
+        std::cout << "NSFW mode will be available after game restart" << std::endl;
         return false;
     }
 
-    // Disable Analytics
+    // Disable Analytics - Similar to Cheat Engine table
     bool DisableAnalytics() {
         if (!connected) {
             std::cout << "Not connected to the game" << std::endl;
@@ -1110,30 +1164,95 @@ public:
             return false;
         }
         
-        // Pattern for analytics manager
-        std::vector<BYTE> pattern = {0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x08, 0xE8};
-        std::string mask = "xxxxxxx";
+        // First try to find the AnalyticsManager.DestroyInstance method
+        std::vector<BYTE> pattern = {0x55, 0x8B, 0xEC, 0x6A, 0x00, 0xE8}; // Common method prologue
+        std::string mask = "xxxxxx";
         
-        uintptr_t patternAddress = FindPatternAddress(pattern, mask);
-        if (patternAddress == 0) {
-            std::cout << "Failed to find analytics pattern" << std::endl;
-            return false;
+        uintptr_t destroyMethodAddr = FindPatternAddress(pattern, mask);
+        if (destroyMethodAddr != 0) {
+            std::cout << "Found potential analytics method at: 0x" << std::hex << destroyMethodAddr << std::dec << std::endl;
+            
+            // Create patch to execute once and return immediately after
+            std::vector<BYTE> patch = {
+                0xC3  // ret
+            };
+            
+            if (PatchMemory(destroyMethodAddr, patch, patchName)) {
+                std::cout << "Analytics disabled successfully!" << std::endl;
+                return true;
+            }
         }
         
-        std::cout << "Found analytics pattern at: 0x" << std::hex << patternAddress << std::dec << std::endl;
+        // Alternative approach - try to patch all Analytics flags in PrivacySettings
+        std::vector<BYTE> privacyPattern = {0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x14, 0xC6, 0x05}; // PrivacySettings method
+        std::string privacyMask = "xxxxxxxx";
         
-        // Create patch to return immediately
-        std::vector<BYTE> patch = {
-            0xC3  // ret
-        };
-        
-        if (!PatchMemory(patternAddress, patch, patchName)) {
-            std::cout << "Failed to patch analytics" << std::endl;
-            return false;
+        uintptr_t privacyAddr = FindPatternAddress(privacyPattern, privacyMask);
+        if (privacyAddr != 0) {
+            std::cout << "Found privacy settings at: 0x" << std::hex << privacyAddr << std::dec << std::endl;
+            
+            // Try to find where analytics flags are set
+            uintptr_t flagsAddr = 0;
+            for (int i = 0; i < 100; i++) {
+                BYTE val = ReadMemory<BYTE>(privacyAddr + i + 8);
+                if (val == 0x01) {
+                    flagsAddr = ReadMemory<uintptr_t>(privacyAddr + i + 4);
+                    if (flagsAddr != 0) {
+                        break;
+                    }
+                }
+            }
+            
+            if (flagsAddr != 0) {
+                // Set all analytics flags to disabled (1)
+                for (int i = 0; i < 4; i++) {
+                    WriteMemory<BYTE>(flagsAddr + i, 1);
+                }
+                
+                std::cout << "Privacy settings patched to disable analytics" << std::endl;
+                
+                // Store patch info for restoration
+                PatchInfo info;
+                info.address = flagsAddr;
+                info.originalBytes = {0x00, 0x00, 0x00, 0x00}; // Assume they were 0
+                info.name = patchName;
+                appliedPatches[patchName] = info;
+                
+                return true;
+            }
         }
         
-        std::cout << "Analytics disabled successfully!" << std::endl;
-        return true;
+        std::cout << "Could not find analytics to disable" << std::endl;
+        return false;
+    }
+
+    // Apply all cheats at once
+    bool ApplyAllCheats() {
+        bool success = true;
+        
+        success &= NoMessagesCooldown();
+        success &= FreeStoreItems();
+        success &= MeetHeartsRequirement();
+        success &= MeetRequirements();
+        success &= NoTalkCooldown();
+        success &= UnlockAllOutfits();
+        success &= OutfitsCostOneDiamond();
+        success &= GiftsCostNoDiamonds();
+        success &= MaxHobbyLevel();
+        success &= NoJobCooldown();
+        success &= MaxJobExperience();
+        success &= ShowAllPinups();
+        success &= UnlockAllRewardsAndGirls();
+        success &= UnlockDLCs();
+        success &= DisableAnalytics();
+        
+        if (success) {
+            std::cout << "All cheats applied successfully!" << std::endl;
+        } else {
+            std::cout << "Some cheats could not be applied" << std::endl;
+        }
+        
+        return success;
     }
 
     // Check if connected to the game
@@ -1146,8 +1265,24 @@ public:
 int main() {
     CrushCrushCheat cheat;
     
-    std::cout << "Crush Crush Cheat - Educational Purposes Only\n";
-    std::cout << "==============================================\n\n";
+    // Make console window centered and properly sized
+    HWND console = GetConsoleWindow();
+    if (console) {
+        RECT r;
+        GetWindowRect(console, &r);
+        int width = 800;
+        int height = 600;
+        int screenWidth = GetSystemMetrics(SM_CXSCREEN);
+        int screenHeight = GetSystemMetrics(SM_CYSCREEN);
+        SetWindowPos(console, NULL, (screenWidth - width) / 2, (screenHeight - height) / 2, width, height, SWP_SHOWWINDOW);
+    }
+    
+    // Set console title
+    SetConsoleTitle(TEXT("Crush Crush Cheat - Table Replicator"));
+    
+    // Change console colors for better readability
+    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    SetConsoleTextAttribute(hConsole, FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY);
     
     std::cout << "This program requires administrator privileges to work correctly.\n";
     
@@ -1158,97 +1293,230 @@ int main() {
         return 1;
     }
     
+    // Define pink color (magenta in Windows console)
+    const WORD PINK_COLOR = FOREGROUND_RED | FOREGROUND_BLUE | FOREGROUND_INTENSITY;
+    
     int choice = 0;
     while (true) {
-        std::cout << "\nCrush Crush Cheat Menu:\n";
-        std::cout << "1. No Messages Cooldown\n";
-        std::cout << "2. Free Store Items\n";
-        std::cout << "3. Meet Hearts Requirement\n";
-        std::cout << "4. Meet All Requirements\n";
-        std::cout << "5. Unlock All Outfits\n";
-        std::cout << "6. Outfits Cost 1 Diamond\n";
-        std::cout << "7. Gifts Cost No Diamonds\n";
-        std::cout << "8. No Talk Cooldown\n";
-        std::cout << "9. Max Hobby Level\n";
-        std::cout << "10. No Job Cooldown\n";
-        std::cout << "11. Max Job Experience\n";
-        std::cout << "12. Show All Pinups\n";
-        std::cout << "13. Unlock All Rewards and Girls\n";
-        std::cout << "14. Unlock DLCs\n";
-        std::cout << "15. Enable NSFW Settings\n";
-        std::cout << "16. Disable Analytics\n";
-        std::cout << "17. Restore a Specific Patch\n";
-        std::cout << "18. Restore All Patches\n";
-        std::cout << "19. Exit\n";
+        // Clear console for prettier look
+        system("cls");
+        
+        // Set title with nice formatting
+        SetConsoleTextAttribute(hConsole, FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY);
+        std::cout << "\n+------------------------------------------+\n";
+        std::cout << "|     Crush Crush Cheat - Table Replicator    |\n";
+        std::cout << "+------------------------------------------+\n\n";
+        
+        // Set pink color for menu options
+        SetConsoleTextAttribute(hConsole, PINK_COLOR);
+        
+        std::cout << " Main Menu:\n";
+        std::cout << "+------------------------------------------+\n";
+        std::cout << "|  1. No Messages Cooldown (Smartphone)      |\n";
+        std::cout << "|  2. Free Store Items (diamond purchases)   |\n";
+        std::cout << "|  3. Meet Hearts Requirement                |\n";
+        std::cout << "|  4. Meet All Requirements                  |\n";
+        std::cout << "|  5. No Talk Cooldown                       |\n";
+        std::cout << "|  6. Unlock All Outfits                     |\n";
+        std::cout << "|  7. Outfits Cost 1 Diamond                 |\n";
+        std::cout << "|  8. Gifts Cost No Diamonds                 |\n";
+        std::cout << "|  9. Max Hobby Level                        |\n";
+        std::cout << "| 10. No Job Cooldown                        |\n";
+        std::cout << "| 11. Max Job Experience                     |\n";
+        std::cout << "| 12. Show All Pinups                        |\n";
+        std::cout << "| 13. Unlock All Rewards and Girls           |\n";
+        std::cout << "| 14. Unlock DLCs (NSFW DLC)                 |\n";
+        std::cout << "| 15. Disable Analytics                      |\n";
+        std::cout << "| 16. Apply All Cheats                       |\n";
+        std::cout << "| 17. Restore a Specific Patch               |\n";
+        std::cout << "| 18. Restore All Patches                    |\n";
+        std::cout << "| 19. Exit                                   |\n";
+        std::cout << "+------------------------------------------+\n";
+        
+        SetConsoleTextAttribute(hConsole, FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY);
         std::cout << "Enter your choice (1-19): ";
         std::cin >> choice;
         
+        // Clear screen before executing command
+        system("cls");
+        
+        // Set success color for output
+        SetConsoleTextAttribute(hConsole, FOREGROUND_GREEN | FOREGROUND_INTENSITY);
+        
+        bool commandExecuted = true;
+        
         switch (choice) {
             case 1:
+                SetConsoleTextAttribute(hConsole, PINK_COLOR);
+                std::cout << "+------------------------------------------+\n";
+                std::cout << "|       No Messages Cooldown (Smartphone)    |\n";
+                std::cout << "+------------------------------------------+\n\n";
+                SetConsoleTextAttribute(hConsole, FOREGROUND_GREEN | FOREGROUND_INTENSITY);
                 cheat.NoMessagesCooldown();
                 break;
             case 2:
+                SetConsoleTextAttribute(hConsole, PINK_COLOR);
+                std::cout << "+------------------------------------------+\n";
+                std::cout << "|       Free Store Items (diamonds)          |\n";
+                std::cout << "+------------------------------------------+\n\n";
+                SetConsoleTextAttribute(hConsole, FOREGROUND_GREEN | FOREGROUND_INTENSITY);
                 cheat.FreeStoreItems();
                 break;
             case 3:
+                SetConsoleTextAttribute(hConsole, PINK_COLOR);
+                std::cout << "+------------------------------------------+\n";
+                std::cout << "|          Meet Hearts Requirement           |\n";
+                std::cout << "+------------------------------------------+\n\n";
+                SetConsoleTextAttribute(hConsole, FOREGROUND_GREEN | FOREGROUND_INTENSITY);
                 cheat.MeetHeartsRequirement();
                 break;
             case 4:
+                SetConsoleTextAttribute(hConsole, PINK_COLOR);
+                std::cout << "+------------------------------------------+\n";
+                std::cout << "|           Meet All Requirements            |\n";
+                std::cout << "+------------------------------------------+\n\n";
+                SetConsoleTextAttribute(hConsole, FOREGROUND_GREEN | FOREGROUND_INTENSITY);
                 cheat.MeetRequirements();
                 break;
             case 5:
-                cheat.UnlockAllOutfits();
-                break;
-            case 6:
-                cheat.OutfitsCostOneDiamond();
-                break;
-            case 7:
-                cheat.GiftsCostNoDiamonds();
-                break;
-            case 8:
+                SetConsoleTextAttribute(hConsole, PINK_COLOR);
+                std::cout << "+------------------------------------------+\n";
+                std::cout << "|             No Talk Cooldown               |\n";
+                std::cout << "+------------------------------------------+\n\n";
+                SetConsoleTextAttribute(hConsole, FOREGROUND_GREEN | FOREGROUND_INTENSITY);
                 cheat.NoTalkCooldown();
                 break;
+            case 6:
+                SetConsoleTextAttribute(hConsole, PINK_COLOR);
+                std::cout << "+------------------------------------------+\n";
+                std::cout << "|            Unlock All Outfits              |\n";
+                std::cout << "+------------------------------------------+\n\n";
+                SetConsoleTextAttribute(hConsole, FOREGROUND_GREEN | FOREGROUND_INTENSITY);
+                cheat.UnlockAllOutfits();
+                break;
+            case 7:
+                SetConsoleTextAttribute(hConsole, PINK_COLOR);
+                std::cout << "+------------------------------------------+\n";
+                std::cout << "|          Outfits Cost 1 Diamond            |\n";
+                std::cout << "+------------------------------------------+\n\n";
+                SetConsoleTextAttribute(hConsole, FOREGROUND_GREEN | FOREGROUND_INTENSITY);
+                cheat.OutfitsCostOneDiamond();
+                break;
+            case 8:
+                SetConsoleTextAttribute(hConsole, PINK_COLOR);
+                std::cout << "+------------------------------------------+\n";
+                std::cout << "|          Gifts Cost No Diamonds            |\n";
+                std::cout << "+------------------------------------------+\n\n";
+                SetConsoleTextAttribute(hConsole, FOREGROUND_GREEN | FOREGROUND_INTENSITY);
+                cheat.GiftsCostNoDiamonds();
+                break;
             case 9:
+                SetConsoleTextAttribute(hConsole, PINK_COLOR);
+                std::cout << "+------------------------------------------+\n";
+                std::cout << "|              Max Hobby Level               |\n";
+                std::cout << "+------------------------------------------+\n\n";
+                SetConsoleTextAttribute(hConsole, FOREGROUND_GREEN | FOREGROUND_INTENSITY);
                 cheat.MaxHobbyLevel();
                 break;
             case 10:
+                SetConsoleTextAttribute(hConsole, PINK_COLOR);
+                std::cout << "+------------------------------------------+\n";
+                std::cout << "|             No Job Cooldown                |\n";
+                std::cout << "+------------------------------------------+\n\n";
+                SetConsoleTextAttribute(hConsole, FOREGROUND_GREEN | FOREGROUND_INTENSITY);
                 cheat.NoJobCooldown();
                 break;
             case 11:
+                SetConsoleTextAttribute(hConsole, PINK_COLOR);
+                std::cout << "+------------------------------------------+\n";
+                std::cout << "|            Max Job Experience              |\n";
+                std::cout << "+------------------------------------------+\n\n";
+                SetConsoleTextAttribute(hConsole, FOREGROUND_GREEN | FOREGROUND_INTENSITY);
                 cheat.MaxJobExperience();
                 break;
             case 12:
+                SetConsoleTextAttribute(hConsole, PINK_COLOR);
+                std::cout << "+------------------------------------------+\n";
+                std::cout << "|             Show All Pinups                |\n";
+                std::cout << "+------------------------------------------+\n\n";
+                SetConsoleTextAttribute(hConsole, FOREGROUND_GREEN | FOREGROUND_INTENSITY);
                 cheat.ShowAllPinups();
                 break;
             case 13:
+                SetConsoleTextAttribute(hConsole, PINK_COLOR);
+                std::cout << "+------------------------------------------+\n";
+                std::cout << "|        Unlock All Rewards and Girls        |\n";
+                std::cout << "+------------------------------------------+\n\n";
+                SetConsoleTextAttribute(hConsole, FOREGROUND_GREEN | FOREGROUND_INTENSITY);
                 cheat.UnlockAllRewardsAndGirls();
                 break;
             case 14:
+                SetConsoleTextAttribute(hConsole, PINK_COLOR);
+                std::cout << "+------------------------------------------+\n";
+                std::cout << "|          Unlock DLCs (NSFW DLC)            |\n";
+                std::cout << "+------------------------------------------+\n\n";
+                SetConsoleTextAttribute(hConsole, FOREGROUND_GREEN | FOREGROUND_INTENSITY);
                 cheat.UnlockDLCs();
                 break;
             case 15:
-                cheat.EnableNSFW();
-                break;
-            case 16:
+                SetConsoleTextAttribute(hConsole, PINK_COLOR);
+                std::cout << "+------------------------------------------+\n";
+                std::cout << "|            Disable Analytics               |\n";
+                std::cout << "+------------------------------------------+\n\n";
+                SetConsoleTextAttribute(hConsole, FOREGROUND_GREEN | FOREGROUND_INTENSITY);
                 cheat.DisableAnalytics();
                 break;
+            case 16:
+                SetConsoleTextAttribute(hConsole, PINK_COLOR);
+                std::cout << "+------------------------------------------+\n";
+                std::cout << "|             Apply All Cheats               |\n";
+                std::cout << "+------------------------------------------+\n\n";
+                SetConsoleTextAttribute(hConsole, FOREGROUND_GREEN | FOREGROUND_INTENSITY);
+                cheat.ApplyAllCheats();
+                break;
             case 17: {
+                SetConsoleTextAttribute(hConsole, PINK_COLOR);
+                std::cout << "+------------------------------------------+\n";
+                std::cout << "|         Restore a Specific Patch           |\n";
+                std::cout << "+------------------------------------------+\n\n";
                 // Restore a specific patch
                 std::string patchName;
-                std::cout << "Enter the name of the patch to restore (e.g. NoMessagesCooldown): ";
-                std::cin >> patchName;
+                std::cin.ignore(); // Clear input buffer
+                SetConsoleTextAttribute(hConsole, FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY);
+                std::cout << "Enter the name of the patch to restore: ";
+                std::getline(std::cin, patchName);
+                SetConsoleTextAttribute(hConsole, FOREGROUND_GREEN | FOREGROUND_INTENSITY);
                 cheat.RestorePatch(patchName);
                 break;
             }
             case 18:
+                SetConsoleTextAttribute(hConsole, PINK_COLOR);
+                std::cout << "+------------------------------------------+\n";
+                std::cout << "|           Restore All Patches              |\n";
+                std::cout << "+------------------------------------------+\n\n";
+                SetConsoleTextAttribute(hConsole, FOREGROUND_GREEN | FOREGROUND_INTENSITY);
                 cheat.RestoreAllPatches();
                 break;
             case 19:
-                std::cout << "Exiting...\n";
+                SetConsoleTextAttribute(hConsole, PINK_COLOR);
+                std::cout << "+------------------------------------------+\n";
+                std::cout << "|                 Exiting...                 |\n";
+                std::cout << "+------------------------------------------+\n\n";
+                SetConsoleTextAttribute(hConsole, FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY);
                 return 0;
             default:
+                // Set error color
+                SetConsoleTextAttribute(hConsole, FOREGROUND_RED | FOREGROUND_INTENSITY);
                 std::cout << "Invalid choice, please try again.\n";
+                commandExecuted = false;
                 break;
+        }
+        
+        if (commandExecuted) {
+            SetConsoleTextAttribute(hConsole, FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY);
+            std::cout << "\nPress Enter to return to menu...";
+            std::cin.ignore(10000, '\n');  // Using simpler approach instead of numeric_limits
+            std::cin.get();
         }
     }
     
